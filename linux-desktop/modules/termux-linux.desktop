@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Termux Linux Desktop
+Comment=Proot Ubuntu with XFCE Desktop Environment
+Exec=%BIN_DIR%/termux-linux
+Icon=applications-other
+Terminal=false
+Type=Application
+Categories=System;Utility;
+Keywords=termux;linux;ubuntu;xfce;proot;

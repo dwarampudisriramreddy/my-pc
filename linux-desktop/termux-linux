@@ -1,0 +1,832 @@
+#!/usr/bin/env python3
+"""
+Termux Linux Desktop GUI
+=========================
+Self-contained Linux desktop app with embedded XFCE via VNC.
+Incorporates termux-x11 architecture patterns:
+  - Clean display session management
+  - Modular preference system
+  - Self-contained X desktop rendering
+
+No external X server apps needed — everything runs in this window.
+"""
+
+import sys
+import os
+import subprocess
+import signal
+import time
+import socket
+import struct
+import threading
+from pathlib import Path
+
+try:
+    import gi
+    gi.require_version('Gtk', '3.0')
+    gi.require_version('GLib', '2.0')
+    gi.require_version('Gdk', '3.0')
+    gi.require_version('Pango', '1.0')
+    from gi.repository import Gtk, GLib, Gdk, Pango, GdkPixbuf
+except ImportError as e:
+    print(f"Error: GTK3 Python bindings not found ({e})")
+    print("Install: python3-gi python3-gi-cairo gir1.2-gtk-3.0")
+    sys.exit(1)
+
+# Try to import GtkVnc for embedded display
+HAVE_VNC_WIDGET = False
+try:
+    gi.require_version('GtkVnc', '2.0')
+    from gi.repository import GtkVnc
+    HAVE_VNC_WIDGET = True
+except (ImportError, ValueError):
+    pass
+
+# ─── Constants ───────────────────────────────────────────────────────────────
+
+APP_NAME = "Termux Linux Desktop"
+APP_VERSION = "0.1.0"
+CONFIG_DIR = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'termux-linux'
+INSTALL_DIR = CONFIG_DIR / 'ubuntu'
+BIN_DIR = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share')) / 'termux-linux' / 'bin'
+SESSION_FILE = Path('/tmp/termux-linux-desktop.pid')
+LOG_FILE = Path('/tmp/termux-linux-desktop.log')
+
+# Dark theme colors
+C = {
+    'bg': '#1a1a2e', 'surface': '#16213e', 'primary': '#0f3460',
+    'accent': '#e94560', 'success': '#2ecc71', 'warning': '#f39c12',
+    'text': '#e0e0e0', 'text2': '#a0a0a0',
+}
+
+CSS = f"""
+window, .window {{ background: {C['bg']}; color: {C['text']}; }}
+.titlebar {{ background: linear-gradient(135deg, #0f3460, #16213e); padding: 10px 16px; }}
+.titlebar label {{ color: #fff; font-size: 16px; font-weight: bold; }}
+.titlebar .sub {{ font-size: 11px; opacity: .8; }}
+.card {{ background: {C['surface']}; border-radius: 8px; padding: 16px; margin: 4px; }}
+.label-m {{ color: {C['text2']}; font-size: 12px; }}
+.label-v {{ color: {C['text']}; font-size: 13px; font-weight: bold; }}
+.section-title {{ color: {C['accent']}; font-size: 14px; font-weight: bold; padding: 4px 0; }}
+.btn-start {{ background: #0f3460; color: #fff; border: none; border-radius: 6px; padding: 8px 20px; }}
+.btn-start:hover {{ background: #1a5276; }}
+.btn-stop {{ background: {C['accent']}; color: #fff; border: none; border-radius: 6px; padding: 8px 20px; }}
+.btn-stop:hover {{ background: #c0392b; }}
+.btn-sec {{ background: {C['surface']}; color: {C['text']}; border: 1px solid {C['primary']}; border-radius: 6px; padding: 8px 20px; }}
+.btn-sec:hover {{ background: {C['primary']}; }}
+"""
+
+# ─── Shell Helpers ───────────────────────────────────────────────────────────
+
+def sh(cmd, timeout=30):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except Exception as e:
+        return -1, '', str(e)
+
+def get_vnc_port():
+    try:
+        if SESSION_FILE.exists():
+            pid = int(SESSION_FILE.read_text().strip())
+            if os.path.isdir(f'/proc/{pid}'):
+                for port in [5901, 5902, 5900]:
+                    try:
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.settimeout(0.5)
+                        r = s.connect_ex(('127.0.0.1', port))
+                        s.close()
+                        if r == 0:
+                            return port
+                    except:
+                        pass
+    except:
+        pass
+    return None
+
+def desktop_status():
+    if SESSION_FILE.exists():
+        try:
+            pid = int(SESSION_FILE.read_text().strip())
+            if os.path.isdir(f'/proc/{pid}'):
+                port = get_vnc_port()
+                return 'running', pid, port
+        except:
+            pass
+        SESSION_FILE.unlink(missing_ok=True)
+    return 'stopped', None, None
+
+def vnc_start():
+    s = BIN_DIR / 'termux-linux-desktop'
+    return sh(['bash', str(s), 'start']) if s.exists() else (-1, '', 'not found')
+
+def vnc_stop():
+    s = BIN_DIR / 'termux-linux-desktop'
+    if s.exists():
+        return sh(['bash', str(s), 'stop'])
+    pid = get_vnc_port()
+    if pid: os.kill(pid, signal.SIGTERM)
+    return 0, '', ''
+
+def rootfs_info():
+    ok = INSTALL_DIR.exists() and (INSTALL_DIR / 'bin' / 'bash').exists()
+    if ok:
+        try:
+            sz = subprocess.run(['du', '-sh', str(INSTALL_DIR)], capture_output=True, text=True).stdout.split()[0]
+        except:
+            sz = '?'
+        bs = (INSTALL_DIR / '.bootstrapped').exists()
+        return 'installed', sz, bs
+    return 'not_installed', None, False
+
+def open_terminal():
+    session = BIN_DIR / 'termux-linux-session'
+    if not session.exists():
+        return
+    term = os.environ.get('TERMINAL', '')
+    if not term:
+        for c in ['xfce4-terminal', 'gnome-terminal', 'konsole', 'xterm', 'lxterminal', 'foot']:
+            if subprocess.run(['which', c], capture_output=True).returncode == 0:
+                term = c; break
+    if not term:
+        term = 'xterm'
+    subprocess.Popen([term, '-e', f'bash -c "exec {session}"'])
+
+# ─── VNC Viewer Widget (GTK DrawingArea based) ──────────────────────────────
+# Simple RFB pixel renderer as fallback when GtkVnc is not available
+
+class RFBClient(threading.Thread):
+    def __init__(self, host, port, width, height, on_update):
+        super().__init__(daemon=True)
+        self.host = host
+        self.port = port
+        self.width = width
+        self.height = height
+        self.on_update = on_update
+        self.sock = None
+        self.running = True
+        self.pixels = bytearray(width * height * 4)
+
+    def run(self):
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(10)
+            self.sock.connect((self.host, self.port))
+            self._handshake()
+            while self.running:
+                self._read_frame()
+        except Exception as e:
+            print(f"RFB error: {e}")
+        finally:
+            if self.sock: self.sock.close()
+
+    def _handshake(self):
+        s = self.sock
+        buf = s.recv(12)
+        assert buf[:4] == b'RFB '
+        ver = buf[4:].decode()
+        # Send 3.3
+        s.send(b'RFB 003.003\n')
+        # auth: none
+        auth = s.recv(4)
+        if auth[:1] == b'\x01':
+            s.send(b'\x01')  # no auth
+        elif auth[:1] == b'\x02':
+            # VNC auth challenge
+            chal = s.recv(16)
+            s.send(b'\x00' * 16)  # dummy response
+            result = s.recv(4)
+        # client init: shared
+        s.send(b'\x01')
+        # server init
+        data = s.recv(24)
+        fmt = '!HBHHH' + 'H' * 16
+        fw, fh = struct.unpack_from('!HH', data, 0)
+        self.width, self.height = fw, fh
+        # set pixel format: 32-bit BGRA
+        s.send(b'\x00' + struct.pack('!BBBBHHHBBBB',
+            32, 24, 0, 1,  # bpp, depth, bigendian, truecolor
+            255, 255, 255,  # red, green, blue max
+            16, 8, 0,       # red, green, blue shift
+            0, 0, 0, 0, 0))  # padding
+        s.send(b'\x02')  # set encodings
+        s.send(struct.pack('!B', 1))  # padding + count
+        s.send(struct.pack('!i', 0))  # raw encoding
+        # framebuffer update request
+        self._req_update()
+
+    def _req_update(self):
+        s = self.sock
+        s.send(struct.pack('!BBHHHH', 3, 0, 0, 0, self.width, self.height))
+
+    def _read_frame(self):
+        s = self.sock
+        while self.running:
+            typ = s.recv(1)
+            if not typ:
+                break
+            if typ == b'\x00':
+                s.recv(1)  # padding
+                num = struct.unpack('!H', s.recv(2))[0]
+                for _ in range(num):
+                    x, y, w, h, enc = struct.unpack('!HHHHi', s.recv(16))
+                    if enc == 0:
+                        data = s.recv(w * h * 4)
+                        self._blit(data, x, y, w, h)
+                        if self.on_update:
+                            GLib.idle_add(self.on_update)
+                self._req_update()
+            elif typ == b'\x02':
+                s.recv(3)  # bell
+            else:
+                break
+
+    def _blit(self, data, x, y, w, h):
+        for row in range(h):
+            start = ((y + row) * self.width + x) * 4
+            data_start = row * w * 4
+            self.pixels[start:start + w * 4] = data[data_start:data_start + w * 4]
+
+    def stop(self):
+        self.running = False
+
+class SimpleVncView(Gtk.DrawingArea):
+    def __init__(self, width=1280, height=720):
+        super().__init__()
+        self.vnc_width = width
+        self.vnc_height = height
+        self.client = None
+        self.pixels = bytearray(width * height * 4)
+        self.set_size_request(width // 2, height // 2)
+        self.connect('draw', self.on_draw)
+
+        self.da = GdkPixbuf.Pixbuf.new_from_data(
+            self.pixels, GdkPixbuf.Colorspace.RGB, True, 8, width, height, width * 4)
+        # Note: above is simplified - we'll just use the draw signal
+
+    def on_draw(self, widget, cr):
+        w = self.get_allocated_width()
+        h = self.get_allocated_height()
+
+        cr.set_source_rgb(0.1, 0.1, 0.18)
+        cr.rectangle(0, 0, w, h)
+        cr.fill()
+
+        if not self.client or not self.client.pixels:
+            cr.set_source_rgb(0.4, 0.4, 0.5)
+            cr.select_font_face('Sans', 0, 0)
+            cr.set_font_size(18)
+            te = cr.text_extents('Desktop Stopped')
+            cr.move_to(w/2 - te.width/2, h/2)
+            cr.show_text('Desktop Stopped')
+            cr.set_font_size(13)
+            te2 = cr.text_extents('Click "Start" above to launch XFCE')
+            cr.move_to(w/2 - te2.width/2, h/2 + 30)
+            cr.show_text('Click "Start" above to launch XFCE')
+            return
+
+        # Scale to fit
+        sx = w / self.vnc_width
+        sy = h / self.vnc_height
+        scale = min(sx, sy)
+        ox = (w - self.vnc_width * scale) / 2
+        oy = (h - self.vnc_height * scale) / 2
+
+        pixels = bytes(self.client.pixels) if self.client.pixels else self.pixels
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_bytes(
+                GLib.Bytes.new(pixels),
+                GdkPixbuf.Colorspace.RGB, True, 8,
+                self.vnc_width, self.vnc_height,
+                self.vnc_width * 4)
+            scaled = pb.scale_simple(
+                int(self.vnc_width * scale), int(self.vnc_height * scale),
+                GdkPixbuf.InterpType.BILINEAR)
+            Gdk.cairo_set_source_pixbuf(cr, scaled, ox, oy)
+            cr.paint()
+        except:
+            pass
+
+    def connect_vnc(self, host='127.0.0.1', port=5901):
+        self.client = RFBClient(host, port, self.vnc_width, self.vnc_height, self.queue_draw)
+        self.client.start()
+
+    def disconnect_vnc(self):
+        if self.client:
+            self.client.stop()
+            self.client = None
+        self.queue_draw()
+
+# ─── Main Application ────────────────────────────────────────────────────────
+
+class TermuxLinuxApp:
+    def __init__(self):
+        GLib.set_application_name(APP_NAME)
+
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS.encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self.vnc_host = '127.0.0.1'
+        self.vnc_port = 5901
+        self.vnc_width = 1280
+        self.vnc_height = 720
+        self.setup_needed = (rootfs_info()[0] == 'not_installed')
+
+        self.build_ui()
+        self.load_settings()
+        self.refresh_all()
+
+        # Periodic status refresh
+        GLib.timeout_add_seconds(3, self.refresh_all)
+
+    def build_ui(self):
+        self.window = Gtk.Window()
+        self.window.set_title(APP_NAME)
+        self.window.set_default_size(960, 720)
+        self.window.set_position(Gtk.WindowPosition.CENTER)
+        self.window.connect('destroy', Gtk.main_quit)
+        self.window.set_icon_name('applications-other')
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        # Title bar
+        tb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        tb.get_style_context().add_class('titlebar')
+        tt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        tl = Gtk.Label(label='Termux Linux Desktop'); tl.set_halign(Gtk.Align.START)
+        tt.pack_start(tl, False, False, 0)
+        ts = Gtk.Label(label=f'v{APP_VERSION} — Embedded XFCE via VNC'); ts.get_style_context().add_class('sub'); ts.set_halign(Gtk.Align.START)
+        tt.pack_start(ts, False, False, 0)
+        tb.pack_start(tt, False, False, 0)
+        vbox.pack_start(tb, False, False, 0)
+
+        # Notebook
+        self.nb = Gtk.Notebook()
+        vbox.pack_start(self.nb, True, True, 0)
+
+        self.build_desktop_tab()
+        self.build_terminal_tab()
+        self.build_settings_tab()
+        self.build_about_tab()
+
+        self.window.add(vbox)
+        self.window.show_all()
+        self.update_buttons()
+
+    # ─── Tab: Desktop ────────────────────────────────────────────────────────
+
+    def build_desktop_tab(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        vbox.set_margin_start(8)
+        vbox.set_margin_end(8)
+        vbox.set_margin_top(8)
+        vbox.set_margin_bottom(8)
+
+        # VNC view
+        if HAVE_VNC_WIDGET:
+            self.vnc_display = GtkVnc.Display()
+            self.vnc_display.set_size_request(-1, 400)
+            self.vnc_display.set_enable_keyboard(True)
+            self.vnc_display.set_enable_pointer(True)
+            vbox.pack_start(self.vnc_display, True, True, 0)
+        else:
+            self.vnc_display = SimpleVncView(self.vnc_width, self.vnc_height)
+            self.vnc_display.set_size_request(-1, 400)
+            vbox.pack_start(self.vnc_display, True, True, 0)
+            # Badge
+            badge = Gtk.Label(label='[GtkVnc not installed — using software renderer]')
+            badge.get_style_context().add_class('label-m')
+            badge.set_halign(Gtk.Align.CENTER)
+            vbox.pack_start(badge, False, False, 2)
+
+        # Controls
+        controls = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        controls.get_style_context().add_class('card')
+
+        # Status row
+        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        self.status_label = Gtk.Label(label='● Stopped')
+        self.status_label.get_style_context().add_class('label-v')
+        status_row.pack_start(self.status_label, False, False, 0)
+
+        self.info_label = Gtk.Label(label='')
+        self.info_label.get_style_context().add_class('label-m')
+        status_row.pack_start(self.info_label, False, False, 0)
+        status_row.pack_end(Gtk.Label(label=''), True, True, 0)
+        controls.pack_start(status_row, False, False, 0)
+
+        # Buttons
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_row.set_halign(Gtk.Align.CENTER)
+        btn_row.set_margin_top(8)
+
+        self.start_btn = Gtk.Button(label='▶ Start Desktop')
+        self.start_btn.get_style_context().add_class('btn-start')
+        self.start_btn.connect('clicked', self.on_start)
+
+        self.stop_btn = Gtk.Button(label='■ Stop Desktop')
+        self.stop_btn.get_style_context().add_class('btn-stop')
+        self.stop_btn.connect('clicked', self.on_stop)
+        self.stop_btn.set_sensitive(False)
+
+        self.term_btn = Gtk.Button(label='⌨ Terminal')
+        self.term_btn.get_style_context().add_class('btn-sec')
+        self.term_btn.connect('clicked', lambda x: open_terminal())
+
+        btn_row.pack_start(self.start_btn, False, False, 3)
+        btn_row.pack_start(self.stop_btn, False, False, 3)
+        btn_row.pack_start(self.term_btn, False, False, 3)
+        controls.pack_start(btn_row, False, False, 0)
+
+        vbox.pack_start(controls, False, False, 0)
+
+        # Log
+        log_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        log_box.get_style_context().add_class('card')
+        lt = Gtk.Label(label='Session Log'); lt.get_style_context().add_class('section-title'); lt.set_halign(Gtk.Align.START)
+        log_box.pack_start(lt, False, False, 0)
+
+        self.log_buf = Gtk.TextBuffer()
+        self.log_view = Gtk.TextView(buffer=self.log_buf)
+        self.log_view.set_editable(False)
+        self.log_view.set_cursor_visible(False)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        sw = Gtk.ScrolledWindow()
+        sw.set_min_content_height(80)
+        sw.add(self.log_view)
+        log_box.pack_start(sw, True, True, 0)
+        vbox.pack_start(log_box, False, False, 0)
+
+        scr = Gtk.ScrolledWindow()
+        scr.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scr.add(vbox)
+        self.nb.append_page(scr, Gtk.Label(label='Desktop'))
+
+    # ─── Tab: Terminal ───────────────────────────────────────────────────────
+
+    def build_terminal_tab(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        vbox.set_valign(Gtk.Align.CENTER)
+        vbox.set_margin_start(32)
+        vbox.set_margin_end(32)
+        vbox.set_margin_top(32)
+        vbox.set_margin_bottom(32)
+
+        icon = Gtk.Label(label='⌨')
+        icon.set_markup('<span size="60000">⌨</span>')
+        vbox.pack_start(icon, False, False, 0)
+
+        lbl = Gtk.Label(label='Terminal Access')
+        lbl.set_markup('<span size="large" weight="bold">Terminal Access</span>')
+        vbox.pack_start(lbl, False, False, 0)
+
+        desc = Gtk.Label(
+            label='Open a bash shell inside the proot Ubuntu environment.\n'
+                  'Run commands, install packages, and manage your system.')
+        desc.set_line_wrap(True)
+        desc.set_justify(Gtk.Justification.CENTER)
+        vbox.pack_start(desc, False, False, 0)
+
+        btn = Gtk.Button(label='Open Terminal')
+        btn.get_style_context().add_class('btn-start')
+        btn.connect('clicked', lambda x: open_terminal())
+        vbox.pack_start(btn, False, False, 0)
+
+        info = Gtk.Label(
+            label='You can also use:  tls   (from any terminal)')
+        info.get_style_context().add_class('label-m')
+        vbox.pack_start(info, False, False, 0)
+
+        scr = Gtk.ScrolledWindow()
+        scr.add(vbox)
+        self.nb.append_page(scr, Gtk.Label(label='Terminal'))
+
+    # ─── Tab: Settings ───────────────────────────────────────────────────────
+
+    def build_settings_tab(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        vbox.set_margin_start(16)
+        vbox.set_margin_end(16)
+        vbox.set_margin_top(16)
+        vbox.set_margin_bottom(16)
+
+        # VNC section
+        s1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        s1.get_style_context().add_class('card')
+        st1 = Gtk.Label(label='Display Settings'); st1.get_style_context().add_class('section-title'); st1.set_halign(Gtk.Align.START)
+        s1.pack_start(st1, False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=8)
+        self.entries = {}
+        fields = [
+            ('VNC Display:', 'vnc_display', ':1', 'e.g. :1'),
+            ('VNC Port:', 'vnc_port', '5901', '5900 + display number'),
+            ('Resolution:', 'vnc_geometry', '1280x720', 'WIDTHxHEIGHT'),
+            ('Color Depth:', 'vnc_depth', '24', '16 or 24'),
+            ('VNC Host:', 'vnc_host', '127.0.0.1', 'localhost'),
+        ]
+        for i, (label, key, default, tip) in enumerate(fields):
+            lbl = Gtk.Label(label=label)
+            lbl.get_style_context().add_class('label-m')
+            lbl.set_halign(Gtk.Align.END)
+            ent = Gtk.Entry()
+            ent.set_text(default)
+            ent.set_tooltip_text(tip)
+            self.entries[key] = ent
+            grid.attach(lbl, 0, i, 1, 1)
+            grid.attach(ent, 1, i, 1, 1)
+        s1.pack_start(grid, False, False, 0)
+        vbox.pack_start(s1, False, False, 0)
+
+        # Auto-start
+        s2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        s2.get_style_context().add_class('card')
+        st2 = Gtk.Label(label='Startup'); st2.get_style_context().add_class('section-title'); st2.set_halign(Gtk.Align.START)
+        s2.pack_start(st2, False, False, 0)
+        ab = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        al = Gtk.Label(label='Auto-start desktop on launch')
+        al.get_style_context().add_class('label-m')
+        self.auto_switch = Gtk.Switch()
+        ab.pack_start(al, False, False, 0)
+        ab.pack_end(self.auto_switch, False, False, 0)
+        s2.pack_start(ab, False, False, 0)
+        vbox.pack_start(s2, False, False, 0)
+
+        # Actions
+        s3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        s3.get_style_context().add_class('card')
+        st3 = Gtk.Label(label='Management'); st3.get_style_context().add_class('section-title'); st3.set_halign(Gtk.Align.START)
+        s3.pack_start(st3, False, False, 0)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_row.set_halign(Gtk.Align.CENTER)
+        save_btn = Gtk.Button(label='Save Settings')
+        save_btn.get_style_context().add_class('btn-start')
+        save_btn.connect('clicked', self.on_save)
+        setup_btn = Gtk.Button(label='Run Setup')
+        setup_btn.get_style_context().add_class('btn-sec')
+        setup_btn.connect('clicked', self.on_setup)
+        config_btn = Gtk.Button(label='Config Folder')
+        config_btn.get_style_context().add_class('btn-sec')
+        config_btn.connect('clicked', lambda x: (CONFIG_DIR.mkdir(parents=True, exist_ok=True), subprocess.Popen(['xdg-open', str(CONFIG_DIR)])))
+        btn_row.pack_start(save_btn, False, False, 0)
+        btn_row.pack_start(setup_btn, False, False, 0)
+        btn_row.pack_start(config_btn, False, False, 0)
+        s3.pack_start(btn_row, False, False, 0)
+        vbox.pack_start(s3, False, False, 0)
+
+        # Rootfs info
+        s4 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        s4.get_style_context().add_class('card')
+        st4 = Gtk.Label(label='Rootfs'); st4.get_style_context().add_class('section-title'); st4.set_halign(Gtk.Align.START)
+        s4.pack_start(st4, False, False, 0)
+        self.rootfs_labels = {}
+        for key, label in [('rootfs_status', 'Status:'), ('rootfs_location', 'Location:'), ('rootfs_size', 'Size:'), ('rootfs_bootstrapped', 'Bootstrapped:')]:
+            hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            lbl = Gtk.Label(label=label); lbl.get_style_context().add_class('label-m'); lbl.set_halign(Gtk.Align.END)
+            val = Gtk.Label(label='—'); val.get_style_context().add_class('label-v'); val.set_halign(Gtk.Align.START)
+            self.rootfs_labels[key] = val
+            hb.pack_start(lbl, False, False, 0); hb.pack_start(val, False, False, 0)
+            s4.pack_start(hb, False, False, 0)
+        vbox.pack_start(s4, False, False, 0)
+
+        scr = Gtk.ScrolledWindow()
+        scr.add(vbox)
+        self.nb.append_page(scr, Gtk.Label(label='Settings'))
+
+    # ─── Tab: About ──────────────────────────────────────────────────────────
+
+    def build_about_tab(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        vbox.set_valign(Gtk.Align.CENTER)
+        vbox.set_margin_start(32)
+        vbox.set_margin_end(32)
+        vbox.set_margin_top(32)
+        vbox.set_margin_bottom(32)
+
+        nl = Gtk.Label()
+        nl.set_markup(f'<span size="xx-large" weight="bold">{APP_NAME}</span>')
+        vbox.pack_start(nl, False, False, 0)
+
+        vl = Gtk.Label(label=f'Version {APP_VERSION}')
+        vl.get_style_context().add_class('label-m')
+        vbox.pack_start(vl, False, False, 0)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        vbox.pack_start(sep, False, False, 4)
+
+        desc = (
+            'A self-contained Linux desktop application that sets up\n'
+            'and manages a proot-based Ubuntu environment with the\n'
+            'XFCE desktop, rendered directly in the app window via VNC.\n\n'
+            'No external X servers or separate apps required.\n\n'
+            'Built with architecture patterns from:\n'
+            '  • termux-app — Terminal emulator & Linux environment for Android\n'
+            '  • termux-x11 — X server with clean display session management')
+        dl = Gtk.Label(label=desc)
+        dl.set_line_wrap(True)
+        dl.set_justify(Gtk.Justification.CENTER)
+        vbox.pack_start(dl, False, False, 0)
+
+        ll = Gtk.Label()
+        ll.set_markup('<a href="https://github.com/termux/termux-app">termux-app</a>  ·  '
+                       '<a href="https://github.com/termux/termux-x11">termux-x11</a>')
+        vbox.pack_start(ll, False, False, 0)
+
+        vcheck = Gtk.Label()
+        hw = 'Hardware renderer' if HAVE_VNC_WIDGET else 'Software renderer (install gir1.2-gtvnc-1.0 for HW accel)'
+        vcheck.set_markup(f'<span size="small">VNC Viewer: {hw}</span>')
+        vbox.pack_start(vcheck, False, False, 0)
+
+        scr = Gtk.ScrolledWindow()
+        scr.add(vbox)
+        self.nb.append_page(scr, Gtk.Label(label='About'))
+
+    # ─── Logic ───────────────────────────────────────────────────────────────
+
+    def load_settings(self):
+        pf = CONFIG_DIR / 'prefs.conf'
+        if pf.exists():
+            try:
+                for line in pf.read_text().splitlines():
+                    line = line.strip()
+                    if '=' in line and not line.startswith('#'):
+                        k, v = line.split('=', 1)
+                        v = v.strip().strip('"\'')
+                        k = k.lower()
+                        if k == 'vnc_display' and 'vnc_display' in self.entries:
+                            self.entries['vnc_display'].set_text(v)
+                        elif k == 'vnc_geometry' and 'vnc_geometry' in self.entries:
+                            self.entries['vnc_geometry'].set_text(v)
+                        elif k == 'vnc_depth' and 'vnc_depth' in self.entries:
+                            self.entries['vnc_depth'].set_text(v)
+                        elif k == 'auto_start':
+                            self.auto_switch.set_active(v.lower() == 'true')
+            except:
+                pass
+        self._apply_vnc_settings()
+
+    def _apply_vnc_settings(self):
+        try:
+            geo = self.entries['vnc_geometry'].get_text() if 'vnc_geometry' in self.entries else '1280x720'
+            w, h = geo.split('x')
+            self.vnc_width, self.vnc_height = int(w), int(h)
+        except:
+            self.vnc_width, self.vnc_height = 1280, 720
+        try:
+            self.vnc_port = int(self.entries['vnc_port'].get_text()) if 'vnc_port' in self.entries else 5901
+        except:
+            self.vnc_port = 5901
+        self.vnc_host = self.entries['vnc_host'].get_text() if 'vnc_host' in self.entries else '127.0.0.1'
+
+    def log(self, msg):
+        buf = self.log_buf
+        end = buf.get_end_iter()
+        buf.insert(end, f'[{time.strftime("%H:%M:%S")}] {msg}\n')
+        self.log_view.scroll_to_mark(buf.create_mark(None, buf.get_end_iter(), False), 0, True, 0, 1)
+
+    def update_buttons(self):
+        status, pid, port = desktop_status()
+        if status == 'running':
+            self.status_label.set_text('● Running')
+            self.status_label.override_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0.18, 0.80, 0.44, 1))
+            self.info_label.set_text(f'PID: {pid}  Port: {port}')
+            self.start_btn.set_sensitive(False)
+            self.stop_btn.set_sensitive(True)
+        else:
+            self.status_label.set_text('○ Stopped')
+            self.status_label.override_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0.63, 0.63, 0.63, 1))
+            self.info_label.set_text('')
+            self.start_btn.set_sensitive(True)
+            self.stop_btn.set_sensitive(False)
+
+    def refresh_rootfs(self):
+        st, sz, bs = rootfs_info()
+        if 'rootfs_status' in self.rootfs_labels:
+            self.rootfs_labels['rootfs_status'].set_text(st)
+        if 'rootfs_location' in self.rootfs_labels:
+            self.rootfs_labels['rootfs_location'].set_text(str(INSTALL_DIR))
+        if 'rootfs_size' in self.rootfs_labels:
+            self.rootfs_labels['rootfs_size'].set_text(sz or '—')
+        if 'rootfs_bootstrapped' in self.rootfs_labels:
+            self.rootfs_labels['rootfs_bootstrapped'].set_text('Yes' if bs else 'No')
+
+    def refresh_all(self):
+        self.update_buttons()
+        self.refresh_rootfs()
+        return True
+
+    def connect_vnc_viewer(self):
+        try:
+            if HAVE_VNC_WIDGET:
+                host = self.vnc_host
+                self.vnc_display.close()
+                self.vnc_display.open_host(host, self.vnc_port)
+                self.log(f'VNC connected to {host}:{self.vnc_port}')
+            else:
+                self.vnc_display.connect_vnc(self.vnc_host, self.vnc_port)
+                self.log(f'VNC (software) connected to {self.vnc_host}:{self.vnc_port}')
+        except Exception as e:
+            self.log(f'VNC connection failed: {e}')
+
+    def disconnect_vnc_viewer(self):
+        try:
+            if HAVE_VNC_WIDGET:
+                self.vnc_display.close()
+            else:
+                self.vnc_display.disconnect_vnc()
+        except:
+            pass
+
+    # ─── Signal Handlers ─────────────────────────────────────────────────────
+
+    def on_start(self, widget):
+        self.log('Starting desktop session...')
+        rc, out, err = vnc_start()
+        if rc == 0 or 'ready' in out or 'running' in out:
+            self.log('VNC server starting, connecting viewer...')
+        else:
+            self.log(f'Start output: {out}')
+
+        # Wait for VNC and connect
+        GLib.timeout_add(1000, self._wait_and_connect, 0)
+
+    def _wait_and_connect(self, attempt):
+        status, pid, port = desktop_status()
+        if status == 'running' and port:
+            self.connect_vnc_viewer()
+            self.log('Desktop ready!')
+            self.update_buttons()
+            return False
+        if attempt > 15:
+            self.log('Timed out waiting for VNC server')
+            self.log(f'Check: {LOG_FILE}')
+            self.update_buttons()
+            return False
+        if attempt == 0:
+            self.log('Waiting for VNC server to be ready...')
+        GLib.timeout_add(1500, self._wait_and_connect, attempt + 1)
+        return False
+
+    def on_stop(self, widget):
+        self.log('Stopping desktop session...')
+        self.disconnect_vnc_viewer()
+        rc, out, err = vnc_stop()
+        self.log(f'Desktop stopped')
+        self.update_buttons()
+        self.refresh_all()
+
+    def on_save(self, widget):
+        self._apply_vnc_settings()
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        pf = CONFIG_DIR / 'prefs.conf'
+        with open(pf, 'w') as f:
+            f.write('# Termux Linux Desktop Preferences\n')
+            for key in ['vnc_display', 'vnc_geometry', 'vnc_depth']:
+                f.write(f'{key.upper()}="{self.entries[key].get_text()}"\n')
+            f.write(f'VNC_PORT="{self.entries["vnc_port"].get_text()}"\n')
+            f.write(f'VNC_HOST="{self.entries["vnc_host"].get_text()}"\n')
+            f.write(f'AUTO_START={"true" if self.auto_switch.get_active() else "false"}\n')
+        self.log('Settings saved')
+        d = Gtk.MessageDialog(transient_for=self.window, flags=0, message_type=Gtk.MessageType.INFO,
+                              buttons=Gtk.ButtonsType.OK, text='Settings Saved')
+        d.format_secondary_text(str(pf))
+        d.run(); d.destroy()
+
+    def on_setup(self, widget):
+        d = Gtk.MessageDialog(transient_for=self.window, flags=0, message_type=Gtk.MessageType.QUESTION,
+                              buttons=Gtk.ButtonsType.YES_NO, text='Run Setup?')
+        d.format_secondary_text('Install proot, Ubuntu rootfs, XFCE, and VNC server.\nRequires internet. May take several minutes.')
+        r = d.run(); d.destroy()
+        if r == Gtk.ResponseType.YES:
+            self.log('Running setup in terminal...')
+            sp = Path(__file__).parent / 'setup.sh'
+            subprocess.Popen(['bash', str(sp)])
+            self.log('Setup started')
+
+    def run(self):
+        if self.setup_needed:
+            d = Gtk.MessageDialog(transient_for=self.window, flags=0, message_type=Gtk.MessageType.QUESTION,
+                                  buttons=Gtk.ButtonsType.YES_NO, text='First Run — Setup Required')
+            d.format_secondary_text('Ubuntu rootfs is not installed.\nRun setup now to install proot + Ubuntu + XFCE + VNC?')
+            r = d.run(); d.destroy()
+            if r == Gtk.ResponseType.YES:
+                sp = Path(__file__).parent / 'setup.sh'
+                subprocess.Popen(['bash', str(sp)])
+                self.log('Setup started in background')
+
+        self.window.present()
+        Gtk.main()
+
+
+def main():
+    app = TermuxLinuxApp()
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == '__main__':
+    main()
