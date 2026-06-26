@@ -60,17 +60,22 @@ public class DesktopSession {
         @Override
         protected Boolean doInBackground(Void... voids) {
             try {
-                String installDir;
-                File extUbuntuDir = context.getExternalFilesDir("ubuntu");
-                if (extUbuntuDir != null) {
-                    installDir = extUbuntuDir.getAbsolutePath();
-                } else {
-                    installDir = Environment.getExternalStorageDirectory().getAbsolutePath()
-                        + "/Android/data/" + context.getPackageName() + "/files/ubuntu";
+                String extStorage = Environment.getExternalStorageDirectory().getAbsolutePath();
+                String installDir = extStorage + "/my-pc/ubuntu";
+
+                File installDirFile = new File(installDir);
+                if (!installDirFile.isDirectory()) {
+                    errorMsg = "Ubuntu rootfs not found at " + installDir
+                        + "\n\nPlease set up Ubuntu first:\n"
+                        + "1. Install proot-distro in termux: pkg install proot-distro\n"
+                        + "2. Install Ubuntu: proot-distro install ubuntu\n"
+                        + "3. Copy rootfs to " + installDir + "\n"
+                        + "   Or set up proot-distro to use this path.\n"
+                        + "4. Install tightvncserver and xfce4 inside Ubuntu:\n"
+                        + "   apt update && apt install tightvncserver xfce4";
+                    return false;
                 }
-                if (!new File(installDir).mkdirs() && !new File(installDir).isDirectory()) {
-                    throw new IOException("Failed to create install directory: " + installDir);
-                }
+
                 String user = "termux";
 
                 File vncDir = new File(installDir + "/home/" + user + "/.vnc");
@@ -101,7 +106,12 @@ public class DesktopSession {
                 if (new File("/dev/shm").exists()) bindings += " -b /dev/shm";
 
                 String prootBin = TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH + "/proot";
-                String cmd = prootBin + " -0 -r " + installDir + bindings +
+                String termuxLibDir = TermuxConstants.TERMUX_LIB_PREFIX_DIR_PATH;
+                String linker64 = "/system/bin/linker64";
+                String linker32 = "/system/bin/linker";
+                String linker = new File(linker64).exists() ? linker64 : linker32;
+
+                String cmd = linker + " " + prootBin + " -0 -r " + installDir + bindings +
                     " -w /home/" + user +
                     " /usr/bin/env -i HOME=/home/" + user +
                     " USER=" + user +
@@ -110,14 +120,16 @@ public class DesktopSession {
                     " su - " + user + " -c 'vncserver " + VNC_DISPLAY +
                     " -geometry 1280x720 -depth 24 -localhost -fg 2>&1'";
 
-                prootProcess = Runtime.getRuntime().exec(new String[]{"sh", "-c", cmd});
+                String[] env = new String[]{"LD_LIBRARY_PATH=" + termuxLibDir};
+                prootProcess = Runtime.getRuntime().exec(new String[]{"/system/bin/sh", "-c", cmd}, env);
                 running = true;
-                Thread.sleep(3000);
+                Thread.sleep(5000);
 
                 try (java.net.Socket test = new java.net.Socket("127.0.0.1", VNC_PORT)) {
                     return true;
                 } catch (IOException e) {
-                    errorMsg = "VNC server not ready on port " + VNC_PORT;
+                    errorMsg = "Desktop error: VNC server not ready on port " + VNC_PORT
+                        + "\nEnsure tightvncserver and xfce4 are installed inside Ubuntu.";
                     return false;
                 }
             } catch (Exception e) {

@@ -210,6 +210,9 @@ final class TermuxInstaller {
                         Os.symlink(symlink.first, symlink.second);
                     }
 
+                    Logger.logInfo(LOG_TAG, "Fixing hardcoded prefix paths in config files.");
+                    fixHardcodedPaths(TERMUX_STAGING_PREFIX_DIR);
+
                     Logger.logInfo(LOG_TAG, "Moving termux prefix staging to prefix directory.");
 
                     if (!TERMUX_STAGING_PREFIX_DIR.renameTo(TERMUX_PREFIX_DIR)) {
@@ -373,6 +376,56 @@ final class TermuxInstaller {
 
     private static Error ensureDirectoryExists(File directory) {
         return FileUtils.createDirectoryFile(directory.getAbsolutePath());
+    }
+
+    private static void fixHardcodedPaths(File prefixDir) {
+        String oldPrefix = "/data/data/com.termux/";
+        String newPrefix = "/data/data/" + TermuxConstants.TERMUX_PACKAGE_NAME + "/";
+        File[] files = prefixDir.listFiles();
+        if (files == null) return;
+        for (File f : files) {
+            fixHardcodedPathsRecursive(f, oldPrefix, newPrefix);
+        }
+    }
+
+    private static void fixHardcodedPathsRecursive(File file, String oldPrefix, String newPrefix) {
+        if (file.isDirectory()) {
+            File[] children = file.listFiles();
+            if (children == null) return;
+            for (File child : children) {
+                fixHardcodedPathsRecursive(child, oldPrefix, newPrefix);
+            }
+            return;
+        }
+        if (!file.isFile()) return;
+        String name = file.getName();
+        if (name.endsWith(".so") || name.endsWith(".dex") || name.endsWith(".jar")) return;
+        if (file.length() > 1024 * 1024) return;
+        byte[] content;
+        try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
+            byte[] header = new byte[4];
+            if (fis.read(header) != 4) return;
+            if (header[0] == 0x7f && header[1] == 'E' && header[2] == 'L' && header[3] == 'F') return;
+            content = new byte[(int) file.length()];
+            System.arraycopy(header, 0, content, 0, 4);
+            int offset = 4;
+            while (offset < content.length) {
+                int read = fis.read(content, offset, content.length - offset);
+                if (read < 0) break;
+                offset += read;
+            }
+        } catch (IOException e) {
+            return;
+        }
+        String text = new String(content, java.nio.charset.StandardCharsets.UTF_8);
+        if (!text.contains(oldPrefix)) return;
+        text = text.replace(oldPrefix, newPrefix);
+        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(file)) {
+            fos.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            Logger.logInfo(LOG_TAG, "Fixed paths in " + file.getAbsolutePath());
+        } catch (IOException e) {
+            Logger.logError(LOG_TAG, "Failed to fix paths in " + file.getAbsolutePath() + ": " + e.getMessage());
+        }
     }
 
     public static byte[] loadZipBytes() {
