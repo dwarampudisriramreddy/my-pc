@@ -46,6 +46,8 @@ import com.ram.pc.shared.termux.settings.preferences.TermuxAppSharedPreferences;
 import com.ram.pc.app.terminal.TermuxSessionsListViewController;
 import com.ram.pc.app.terminal.io.TerminalToolbarViewPager;
 import com.ram.pc.app.terminal.TermuxTerminalViewClient;
+import com.ram.pc.shared.desktop.DesktopSession;
+import com.ram.pc.shared.desktop.VncView;
 import com.ram.pc.shared.termux.extrakeys.ExtraKeysView;
 import com.ram.pc.shared.termux.interact.TextInputDialogUtils;
 import com.ram.pc.shared.logger.Logger;
@@ -189,6 +191,10 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     private static final int CONTEXT_MENU_SETTINGS_ID = 8;
     private static final int CONTEXT_MENU_REPORT_ID = 9;
 
+    VncView mDesktopView;
+    DesktopSession mDesktopSession;
+    boolean mDesktopMode;
+
     private static final String ARG_TERMINAL_TOOLBAR_TEXT_INPUT = "terminal_toolbar_text_input";
     private static final String ARG_ACTIVITY_RECREATED = "activity_recreated";
 
@@ -250,6 +256,8 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         setNewSessionButtonView();
 
         setToggleKeyboardView();
+
+        setDesktopView();
 
         registerForContextMenu(mTerminalView);
 
@@ -597,6 +605,40 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
 
 
 
+
+    private void setDesktopView() {
+        mDesktopView = findViewById(R.id.desktop_view);
+        mDesktopSession = new DesktopSession(this);
+
+        ImageButton desktopButton = findViewById(R.id.desktop_toggle_button);
+        desktopButton.setOnClickListener(v -> toggleDesktopMode());
+    }
+
+    private void toggleDesktopMode() {
+        mDesktopMode = !mDesktopMode;
+        if (mDesktopMode) {
+            mTerminalView.setVisibility(View.GONE);
+            mDesktopView.setVisibility(View.VISIBLE);
+            mDesktopSession.start(new DesktopSession.SessionCallback() {
+                @Override public void onSessionStart(int port) {
+                    showToast("Desktop started on port " + port, false);
+                    mDesktopView.connect("127.0.0.1", port);
+                }
+                @Override public void onSessionError(String error) {
+                    showToast("Desktop error: " + error, true);
+                    toggleDesktopMode();
+                }
+                @Override public void onSessionStop() {
+                    showToast("Desktop stopped", false);
+                }
+            });
+        } else {
+            mDesktopView.disconnect();
+            mDesktopSession.stop();
+            mDesktopView.setVisibility(View.GONE);
+            mTerminalView.setVisibility(View.VISIBLE);
+        }
+    }
 
     @SuppressLint("RtlHardcoded")
     @Override
