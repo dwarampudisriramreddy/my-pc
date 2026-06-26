@@ -60,13 +60,23 @@ public class DesktopSession {
         @Override
         protected Boolean doInBackground(Void... voids) {
             try {
-                String extDir = Environment.getExternalStorageDirectory().getAbsolutePath();
-                String installDir = extDir + "/termux/ubuntu";
-                new File(installDir).mkdirs();
+                String installDir;
+                File extUbuntuDir = context.getExternalFilesDir("ubuntu");
+                if (extUbuntuDir != null) {
+                    installDir = extUbuntuDir.getAbsolutePath();
+                } else {
+                    installDir = Environment.getExternalStorageDirectory().getAbsolutePath()
+                        + "/Android/data/" + context.getPackageName() + "/files/ubuntu";
+                }
+                if (!new File(installDir).mkdirs() && !new File(installDir).isDirectory()) {
+                    throw new IOException("Failed to create install directory: " + installDir);
+                }
                 String user = "termux";
 
                 File vncDir = new File(installDir + "/home/" + user + "/.vnc");
-                vncDir.mkdirs();
+                if (!vncDir.mkdirs() && !vncDir.isDirectory()) {
+                    throw new IOException("Failed to create VNC directory: " + vncDir);
+                }
 
                 File xstartup = new File(vncDir, "xstartup");
                 if (!xstartup.exists()) {
@@ -90,7 +100,8 @@ public class DesktopSession {
                 if (new File("/dev/dri").exists()) bindings += " -b /dev/dri";
                 if (new File("/dev/shm").exists()) bindings += " -b /dev/shm";
 
-                String cmd = "proot -0 -r " + installDir + bindings +
+                String prootBin = TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH + "/proot";
+                String cmd = prootBin + " -0 -r " + installDir + bindings +
                     " -w /home/" + user +
                     " /usr/bin/env -i HOME=/home/" + user +
                     " USER=" + user +
