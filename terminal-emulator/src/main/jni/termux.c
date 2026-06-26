@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #define TERMUX_UNUSED(x) x __attribute__((__unused__))
 #ifdef __APPLE__
@@ -106,6 +107,42 @@ static int create_subprocess(JNIEnv* env,
             fflush(stderr);
         }
         execvp(cmd, argv);
+
+        // If execvp failed, try Android linker fallback for termux ELF binaries
+        // whose DT_INTERP points to the old com.termux path. The linker can load
+        // any ELF binary as long as LD_LIBRARY_PATH points to its shared libraries.
+        char* linker = NULL;
+        struct stat linker_stat;
+        if (stat("/system/bin/linker64", &linker_stat) == 0 && access("/system/bin/linker64", X_OK) == 0) {
+            linker = "/system/bin/linker64";
+        } else if (stat("/system/bin/linker", &linker_stat) == 0 && access("/system/bin/linker", X_OK) == 0) {
+            linker = "/system/bin/linker";
+        }
+        if (linker != NULL) {
+            char libpath[4096];
+            char* p = strstr(cmd, "/bin/");
+            if (p != NULL) {
+                size_t base_len = p - cmd + 1;
+                if (base_len + 4 < sizeof(libpath)) {
+                    memcpy(libpath, cmd, base_len);
+                    memcpy(libpath + base_len, "lib", 4);
+                    setenv("LD_LIBRARY_PATH", libpath, 1);
+                }
+            }
+
+            int argc = 0;
+            while (argv[argc] != NULL) argc++;
+            char** new_argv = malloc((argc + 3) * sizeof(char*));
+            if (new_argv != NULL) {
+                new_argv[0] = linker;
+                new_argv[1] = (char*)cmd;
+                for (int i = 0; i < argc; i++) new_argv[i + 2] = argv[i];
+                new_argv[argc + 2] = NULL;
+                execvp(linker, new_argv);
+                free(new_argv);
+            }
+        }
+
         // Show terminal output about failing exec() call:
         char* error_message;
         if (asprintf(&error_message, "exec(\"%s\")", cmd) == -1) error_message = "exec()";
